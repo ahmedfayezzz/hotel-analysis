@@ -1,0 +1,16 @@
+# Authentication configuration for Hotel Gap Analysis Dashboard
+# Copy this file to config.yaml and update with your credentials
+
+credentials:
+  usernames:
+    product_team:
+      email: product@tripon.com
+      name: Product Team
+      # Generate password hash with:
+      # python -c "import bcrypt; print(bcrypt.hashpw('your_password'.encode(), bcrypt.gensalt()).decode())"
+      password: $2b$12$REPLACE_WITH_YOUR_HASH
+
+cookie:
+  expiry_days: 7
+  key: gap_analysis_secret_key_change_this
+  name: gap_analysis_cookie
