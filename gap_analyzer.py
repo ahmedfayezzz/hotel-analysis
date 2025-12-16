@@ -130,7 +130,7 @@ def find_hotel_date_gaps(
     hotel_name: str,
     city: str,
     star_rating: int,
-    supplier_name: str,
+    suppliers: list,
     start_date: date,
     end_date: date,
     exclusions: list,
@@ -148,6 +148,7 @@ def find_hotel_date_gaps(
         current += timedelta(days=1)
 
     periods = group_consecutive_dates(gap_dates)
+    supplier_names = ", ".join(sorted(suppliers))
 
     return [
         {
@@ -155,7 +156,7 @@ def find_hotel_date_gaps(
             "hotel_name": hotel_name,
             "city": city,
             "star_rating": star_rating,
-            "supplier_name": supplier_name,
+            "supplier_name": supplier_names,
             "gap_type": "date",
             "detail": "No availability",
             "gap_start": p["gap_start"],
@@ -172,7 +173,7 @@ def find_hotel_board_gaps(
     hotel_name: str,
     city: str,
     star_rating: int,
-    supplier_name: str,
+    suppliers: list,
     required_boards: list,
     start_date: date,
     end_date: date,
@@ -181,6 +182,7 @@ def find_hotel_board_gaps(
     """Find periods missing required board types."""
     hotel_data = daily_df.filter(pl.col("hotel_id") == hotel_id)
     hotel_dates_set = set(hotel_data["date"].to_list())
+    supplier_names = ", ".join(sorted(suppliers))
 
     all_gaps = []
 
@@ -209,7 +211,7 @@ def find_hotel_board_gaps(
                 "hotel_name": hotel_name,
                 "city": city,
                 "star_rating": star_rating,
-                "supplier_name": supplier_name,
+                "supplier_name": supplier_names,
                 "gap_type": "board",
                 "detail": f"Missing: {board_name}",
                 "gap_start": p["gap_start"],
@@ -226,7 +228,7 @@ def find_hotel_occupancy_gaps(
     hotel_name: str,
     city: str,
     star_rating: int,
-    supplier_name: str,
+    suppliers: list,
     required_capacities: list,
     start_date: date,
     end_date: date,
@@ -235,6 +237,7 @@ def find_hotel_occupancy_gaps(
     """Find periods missing required occupancies."""
     hotel_data = daily_df.filter(pl.col("hotel_id") == hotel_id)
     hotel_dates_set = set(hotel_data["date"].to_list())
+    supplier_names = ", ".join(sorted(suppliers))
 
     all_gaps = []
 
@@ -264,7 +267,7 @@ def find_hotel_occupancy_gaps(
                 "hotel_name": hotel_name,
                 "city": city,
                 "star_rating": star_rating,
-                "supplier_name": supplier_name,
+                "supplier_name": supplier_names,
                 "gap_type": "occupancy",
                 "detail": f"Missing: {cap_name} ({cap_value})",
                 "gap_start": p["gap_start"],
@@ -286,10 +289,10 @@ def generate_all_hotel_gaps(
     city_filter: Optional[str] = None,
 ) -> pl.DataFrame:
     """Generate comprehensive gap report for all hotels."""
-    # Get unique hotels with their supplier info
-    hotels = daily_df.select([
-        "hotel_id", "hotel_name", "city", "star_rating", "supplier_name"
-    ]).unique()
+    # Get unique hotels and aggregate all their suppliers into a list
+    hotels = daily_df.group_by(["hotel_id", "hotel_name", "city", "star_rating"]).agg([
+        pl.col("supplier_name").unique().alias("suppliers")
+    ])
 
     # Apply city filter
     if city_filter and city_filter != "All":
@@ -306,11 +309,11 @@ def generate_all_hotel_gaps(
         hotel_name = row["hotel_name"]
         city = row["city"]
         star_rating = row["star_rating"]
-        supplier_name = row["supplier_name"]
+        suppliers = row["suppliers"]
 
         # Date gaps
         date_gaps = find_hotel_date_gaps(
-            daily_df, hotel_id, hotel_name, city, star_rating, supplier_name,
+            daily_df, hotel_id, hotel_name, city, star_rating, suppliers,
             start_date, end_date, exclusions
         )
         all_gaps.extend(date_gaps)
@@ -318,7 +321,7 @@ def generate_all_hotel_gaps(
         # Board gaps
         if required_boards:
             board_gaps = find_hotel_board_gaps(
-                daily_df, hotel_id, hotel_name, city, star_rating, supplier_name,
+                daily_df, hotel_id, hotel_name, city, star_rating, suppliers,
                 required_boards, start_date, end_date, exclusions
             )
             all_gaps.extend(board_gaps)
@@ -326,7 +329,7 @@ def generate_all_hotel_gaps(
         # Occupancy gaps
         if required_occupancies:
             occ_gaps = find_hotel_occupancy_gaps(
-                daily_df, hotel_id, hotel_name, city, star_rating, supplier_name,
+                daily_df, hotel_id, hotel_name, city, star_rating, suppliers,
                 required_occupancies, start_date, end_date, exclusions
             )
             all_gaps.extend(occ_gaps)
