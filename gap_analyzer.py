@@ -24,12 +24,30 @@ REQUIRED_OCCUPANCIES = {
     "Quad": 4,
 }
 
+# Occupancy codes for rate creation (maps display name to DB code)
+OCCUPANCY_CODES = {
+    "Double": "DBL",
+    "Triple": "TRP",
+    "Quad": "QAD",
+}
+
+# Board name to meal type code mapping for rate creation
+BOARD_TO_MEAL_CODE = {
+    "Room Only": "ROOM_ONLY",
+    "Breakfast": "BREAKFAST_INCLUDED",
+    "Lunch": "LUNCH_INCLUDED",
+    "Dinner": "DINNER_INCLUDED",
+    "Half Board": "HALF_BOARD",
+    "Full Board": "FULL_BOARD",
+}
+
 
 def rates_to_dataframe(rates: list) -> pl.DataFrame:
     """Convert database rates to Polars DataFrame."""
     if not rates:
         return pl.DataFrame({
             "hotel_id": [],
+            "organization_id": [],
             "hotel_name": [],
             "city": [],
             "star_rating": [],
@@ -52,6 +70,7 @@ def expand_date_ranges(df: pl.DataFrame) -> pl.DataFrame:
         return pl.DataFrame({
             "date": [],
             "hotel_id": [],
+            "organization_id": [],
             "hotel_name": [],
             "city": [],
             "star_rating": [],
@@ -73,6 +92,7 @@ def expand_date_ranges(df: pl.DataFrame) -> pl.DataFrame:
             expanded_rows.append({
                 "date": current_date,
                 "hotel_id": str(row["hotel_id"]),
+                "organization_id": str(row["organization_id"]) if row.get("organization_id") else None,
                 "hotel_name": row["hotel_name"],
                 "city": row["city"],
                 "star_rating": row["star_rating"],
@@ -127,6 +147,7 @@ def group_consecutive_dates(dates: list) -> list:
 def find_hotel_date_gaps(
     daily_df: pl.DataFrame,
     hotel_id: str,
+    organization_id: str,
     hotel_name: str,
     city: str,
     star_rating: int,
@@ -153,6 +174,7 @@ def find_hotel_date_gaps(
     return [
         {
             "hotel_id": hotel_id,
+            "organization_id": organization_id,
             "hotel_name": hotel_name,
             "city": city,
             "star_rating": star_rating,
@@ -170,6 +192,7 @@ def find_hotel_date_gaps(
 def find_hotel_board_gaps(
     daily_df: pl.DataFrame,
     hotel_id: str,
+    organization_id: str,
     hotel_name: str,
     city: str,
     star_rating: int,
@@ -208,6 +231,7 @@ def find_hotel_board_gaps(
         for p in periods:
             all_gaps.append({
                 "hotel_id": hotel_id,
+                "organization_id": organization_id,
                 "hotel_name": hotel_name,
                 "city": city,
                 "star_rating": star_rating,
@@ -225,6 +249,7 @@ def find_hotel_board_gaps(
 def find_hotel_occupancy_gaps(
     daily_df: pl.DataFrame,
     hotel_id: str,
+    organization_id: str,
     hotel_name: str,
     city: str,
     star_rating: int,
@@ -264,6 +289,7 @@ def find_hotel_occupancy_gaps(
         for p in periods:
             all_gaps.append({
                 "hotel_id": hotel_id,
+                "organization_id": organization_id,
                 "hotel_name": hotel_name,
                 "city": city,
                 "star_rating": star_rating,
@@ -290,7 +316,7 @@ def generate_all_hotel_gaps(
 ) -> pl.DataFrame:
     """Generate comprehensive gap report for all hotels."""
     # Get unique hotels and aggregate all their suppliers into a list
-    hotels = daily_df.group_by(["hotel_id", "hotel_name", "city", "star_rating"]).agg([
+    hotels = daily_df.group_by(["hotel_id", "organization_id", "hotel_name", "city", "star_rating"]).agg([
         pl.col("supplier_name").unique().alias("suppliers")
     ])
 
@@ -306,6 +332,7 @@ def generate_all_hotel_gaps(
 
     for row in hotels.iter_rows(named=True):
         hotel_id = row["hotel_id"]
+        organization_id = row["organization_id"]
         hotel_name = row["hotel_name"]
         city = row["city"]
         star_rating = row["star_rating"]
@@ -313,7 +340,7 @@ def generate_all_hotel_gaps(
 
         # Date gaps
         date_gaps = find_hotel_date_gaps(
-            daily_df, hotel_id, hotel_name, city, star_rating, suppliers,
+            daily_df, hotel_id, organization_id, hotel_name, city, star_rating, suppliers,
             start_date, end_date, exclusions
         )
         all_gaps.extend(date_gaps)
@@ -321,7 +348,7 @@ def generate_all_hotel_gaps(
         # Board gaps
         if required_boards:
             board_gaps = find_hotel_board_gaps(
-                daily_df, hotel_id, hotel_name, city, star_rating, suppliers,
+                daily_df, hotel_id, organization_id, hotel_name, city, star_rating, suppliers,
                 required_boards, start_date, end_date, exclusions
             )
             all_gaps.extend(board_gaps)
@@ -329,7 +356,7 @@ def generate_all_hotel_gaps(
         # Occupancy gaps
         if required_occupancies:
             occ_gaps = find_hotel_occupancy_gaps(
-                daily_df, hotel_id, hotel_name, city, star_rating, suppliers,
+                daily_df, hotel_id, organization_id, hotel_name, city, star_rating, suppliers,
                 required_occupancies, start_date, end_date, exclusions
             )
             all_gaps.extend(occ_gaps)
@@ -337,6 +364,7 @@ def generate_all_hotel_gaps(
     if not all_gaps:
         return pl.DataFrame({
             "hotel_id": [],
+            "organization_id": [],
             "hotel_name": [],
             "city": [],
             "star_rating": [],
@@ -366,3 +394,61 @@ def get_supplier_summary(gaps_df: pl.DataFrame) -> pl.DataFrame:
         pl.len().alias("total_gaps"),
         pl.col("duration_days").sum().alias("total_gap_days"),
     ]).sort("total_gap_days", descending=True)
+
+
+def prepare_csv_export_template(gaps_df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Prepare gap data for CSV export with rate creation template columns.
+
+    Adds empty columns that product team needs to fill:
+    - supplier_id, room_type_id, occupancy
+    - weekday_rate, weekend_rate, currency, rate_type
+    - min_booking_days_in_advance, num_of_rooms, included_meal_type_code
+    """
+    if len(gaps_df) == 0:
+        return gaps_df
+
+    # Format dates for export
+    export_df = gaps_df.with_columns([
+        pl.col("gap_start").dt.strftime("%Y-%m-%d").alias("start_date"),
+        pl.col("gap_end").dt.strftime("%Y-%m-%d").alias("end_date"),
+    ])
+
+    # Add empty columns for rate creation (user fills these)
+    export_df = export_df.with_columns([
+        pl.lit("").alias("supplier_id_to_fill"),
+        pl.lit("").alias("room_type_id_to_fill"),
+        pl.lit("").alias("occupancy"),
+        pl.lit("").alias("weekday_rate"),
+        pl.lit("").alias("weekend_rate"),
+        pl.lit("SAR").alias("currency"),
+        pl.lit("subject_to_availability").alias("rate_type"),
+        pl.lit("").alias("min_booking_days_in_advance"),
+        pl.lit("").alias("num_of_rooms"),
+        pl.lit("").alias("included_meal_type_code"),
+    ])
+
+    # Select and order columns for export
+    return export_df.select([
+        "hotel_id",
+        "organization_id",
+        "hotel_name",
+        "city",
+        "star_rating",
+        "gap_type",
+        "detail",
+        "start_date",
+        "end_date",
+        "duration_days",
+        "supplier_name",
+        "supplier_id_to_fill",
+        "room_type_id_to_fill",
+        "occupancy",
+        "weekday_rate",
+        "weekend_rate",
+        "currency",
+        "rate_type",
+        "min_booking_days_in_advance",
+        "num_of_rooms",
+        "included_meal_type_code",
+    ])

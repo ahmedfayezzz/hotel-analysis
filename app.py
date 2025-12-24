@@ -15,15 +15,19 @@ from datetime import date, timedelta
 from pathlib import Path
 import io
 
-from db import get_hotels, get_suppliers, get_hotel_rates, test_connection
+from db import get_hotels, get_suppliers, get_hotel_rates, get_meal_types, get_room_types_by_hotel, test_connection
 from gap_analyzer import (
     rates_to_dataframe,
     expand_date_ranges,
     generate_all_hotel_gaps,
     get_supplier_summary,
+    prepare_csv_export_template,
     BOARD_EQUIVALENTS,
     REQUIRED_OCCUPANCIES,
+    OCCUPANCY_CODES,
+    BOARD_TO_MEAL_CODE,
 )
+from graphql_client import insert_hotel_rate, test_hasura_connection
 
 # Page config
 st.set_page_config(
@@ -54,6 +58,18 @@ def load_all_rates():
     if not rates:
         return pl.DataFrame()
     return rates_to_dataframe(rates)
+
+
+@st.cache_data(show_spinner=False)
+def load_all_meal_types():
+    """Load all meal types from DB (cached)."""
+    return get_meal_types()
+
+
+@st.cache_data(show_spinner=False)
+def load_room_types_for_hotel(hotel_id: str):
+    """Load room types for a specific hotel (cached)."""
+    return get_room_types_by_hotel(hotel_id)
 
 
 def load_auth_config():
@@ -197,7 +213,7 @@ def main_dashboard():
     st.sidebar.caption(f"Daily records: {len(daily_df):,}")
 
     # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📋 Gap Report", "👥 By Supplier", "📊 Summary", "📅 Visualizations"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 Gap Report", "👥 By Supplier", "📊 Summary", "📅 Visualizations", "✏️ Fill Gaps"])
 
     # TAB 1: Gap Report
     with tab1:
@@ -346,21 +362,163 @@ def main_dashboard():
         st.markdown("### 📥 Export")
 
         if "gaps_df" in st.session_state and len(st.session_state.gaps_df) > 0:
-            export_df = st.session_state.gaps_df.with_columns([
-                pl.col("gap_start").dt.strftime("%d-%m-%Y").alias("gap_start"),
-                pl.col("gap_end").dt.strftime("%d-%m-%Y").alias("gap_end"),
-            ])
-            csv_buffer = io.StringIO()
-            export_df.to_pandas().to_csv(csv_buffer, index=False)
-            csv_data = csv_buffer.getvalue()
+            col_exp1, col_exp2 = st.columns(2)
 
-            st.download_button(
-                label="📥 Download All Gaps as CSV",
-                data=csv_data,
-                file_name=f"hotel_gaps_{date.today().strftime('%d-%m-%Y')}.csv",
-                mime="text/csv",
-                type="primary",
-            )
+            with col_exp1:
+                # Simple CSV export (gap report only)
+                export_df = st.session_state.gaps_df.with_columns([
+                    pl.col("gap_start").dt.strftime("%d-%m-%Y").alias("gap_start"),
+                    pl.col("gap_end").dt.strftime("%d-%m-%Y").alias("gap_end"),
+                ])
+                csv_buffer = io.StringIO()
+                export_df.to_pandas().to_csv(csv_buffer, index=False)
+                csv_data = csv_buffer.getvalue()
+
+                st.download_button(
+                    label="📥 Download Gaps (CSV)",
+                    data=csv_data,
+                    file_name=f"hotel_gaps_{date.today().strftime('%d-%m-%Y')}.csv",
+                    mime="text/csv",
+                )
+
+            with col_exp2:
+                # Enhanced Excel template with reference sheets
+                from openpyxl import Workbook
+
+                # Create workbook
+                wb = Workbook()
+
+                # Sheet 1: Gap Template - expanded by room type (one row per room type per gap)
+                ws_gaps = wb.active
+                ws_gaps.title = "Gaps_Template"
+
+                # Headers for expanded template
+                headers = [
+                    "hotel_id", "organization_id", "hotel_name", "city", "star_rating",
+                    "gap_type", "detail", "start_date", "end_date", "duration_days",
+                    "supplier_name", "room_type_id", "room_name", "max_occupancy",
+                    "supplier_id_to_fill", "occupancy", "weekday_rate", "weekend_rate",
+                    "currency", "rate_type", "min_booking_days_in_advance", "num_of_rooms",
+                    "included_meal_type_code"
+                ]
+                for col_idx, header in enumerate(headers, 1):
+                    ws_gaps.cell(row=1, column=col_idx, value=header)
+
+                # Build hotel -> room_types cache
+                hotel_room_types_cache = {}
+                unique_hotels = st.session_state.gaps_df.select(["hotel_id"]).unique()
+                for hotel_row in unique_hotels.iter_rows(named=True):
+                    hotel_id = hotel_row["hotel_id"]
+                    hotel_room_types_cache[hotel_id] = load_room_types_for_hotel(hotel_id)
+
+                # Expand gaps by room type
+                row_idx = 2
+                for gap_row in st.session_state.gaps_df.iter_rows(named=True):
+                    hotel_id = gap_row["hotel_id"]
+                    room_types = hotel_room_types_cache.get(hotel_id, [])
+
+                    # Format dates
+                    start_date_str = gap_row["gap_start"].strftime("%Y-%m-%d") if hasattr(gap_row["gap_start"], "strftime") else str(gap_row["gap_start"])
+                    end_date_str = gap_row["gap_end"].strftime("%Y-%m-%d") if hasattr(gap_row["gap_end"], "strftime") else str(gap_row["gap_end"])
+
+                    if not room_types:
+                        # No room types - still create one row with empty room info
+                        ws_gaps.cell(row=row_idx, column=1, value=hotel_id)
+                        ws_gaps.cell(row=row_idx, column=2, value=gap_row.get("organization_id", ""))
+                        ws_gaps.cell(row=row_idx, column=3, value=gap_row["hotel_name"])
+                        ws_gaps.cell(row=row_idx, column=4, value=gap_row["city"])
+                        ws_gaps.cell(row=row_idx, column=5, value=gap_row["star_rating"])
+                        ws_gaps.cell(row=row_idx, column=6, value=gap_row["gap_type"])
+                        ws_gaps.cell(row=row_idx, column=7, value=gap_row["detail"])
+                        ws_gaps.cell(row=row_idx, column=8, value=start_date_str)
+                        ws_gaps.cell(row=row_idx, column=9, value=end_date_str)
+                        ws_gaps.cell(row=row_idx, column=10, value=gap_row["duration_days"])
+                        ws_gaps.cell(row=row_idx, column=11, value=gap_row["supplier_name"])
+                        ws_gaps.cell(row=row_idx, column=19, value="SAR")
+                        ws_gaps.cell(row=row_idx, column=20, value="subject_to_availability")
+                        row_idx += 1
+                    else:
+                        # Create one row per room type
+                        for rt in room_types:
+                            ws_gaps.cell(row=row_idx, column=1, value=hotel_id)
+                            ws_gaps.cell(row=row_idx, column=2, value=gap_row.get("organization_id", ""))
+                            ws_gaps.cell(row=row_idx, column=3, value=gap_row["hotel_name"])
+                            ws_gaps.cell(row=row_idx, column=4, value=gap_row["city"])
+                            ws_gaps.cell(row=row_idx, column=5, value=gap_row["star_rating"])
+                            ws_gaps.cell(row=row_idx, column=6, value=gap_row["gap_type"])
+                            ws_gaps.cell(row=row_idx, column=7, value=gap_row["detail"])
+                            ws_gaps.cell(row=row_idx, column=8, value=start_date_str)
+                            ws_gaps.cell(row=row_idx, column=9, value=end_date_str)
+                            ws_gaps.cell(row=row_idx, column=10, value=gap_row["duration_days"])
+                            ws_gaps.cell(row=row_idx, column=11, value=gap_row["supplier_name"])
+                            ws_gaps.cell(row=row_idx, column=12, value=str(rt["id"]))  # room_type_id pre-filled
+                            ws_gaps.cell(row=row_idx, column=13, value=rt["name"])  # room_name pre-filled
+                            ws_gaps.cell(row=row_idx, column=14, value=rt["max_occupancy"])  # max_occupancy pre-filled
+                            ws_gaps.cell(row=row_idx, column=19, value="SAR")
+                            ws_gaps.cell(row=row_idx, column=20, value="subject_to_availability")
+                            row_idx += 1
+
+                # Sheet 2: Suppliers Reference
+                ws_suppliers = wb.create_sheet("Suppliers")
+                ws_suppliers.cell(row=1, column=1, value="supplier_id")
+                ws_suppliers.cell(row=1, column=2, value="supplier_name")
+                for row_idx, supplier in enumerate(all_suppliers, 2):
+                    ws_suppliers.cell(row=row_idx, column=1, value=str(supplier["id"]))
+                    ws_suppliers.cell(row=row_idx, column=2, value=supplier["name"])
+
+                # Sheet 3: Room Types Reference
+                ws_rooms = wb.create_sheet("Room_Types")
+                ws_rooms.cell(row=1, column=1, value="hotel_id")
+                ws_rooms.cell(row=1, column=2, value="hotel_name")
+                ws_rooms.cell(row=1, column=3, value="room_type_id")
+                ws_rooms.cell(row=1, column=4, value="room_name")
+                ws_rooms.cell(row=1, column=5, value="max_occupancy")
+                row_idx = 2
+                # Get unique hotels from gaps
+                unique_hotels = st.session_state.gaps_df.select(["hotel_id", "hotel_name"]).unique()
+                for hotel_row in unique_hotels.iter_rows(named=True):
+                    room_types = load_room_types_for_hotel(hotel_row["hotel_id"])
+                    for rt in room_types:
+                        ws_rooms.cell(row=row_idx, column=1, value=hotel_row["hotel_id"])
+                        ws_rooms.cell(row=row_idx, column=2, value=hotel_row["hotel_name"])
+                        ws_rooms.cell(row=row_idx, column=3, value=str(rt["id"]))
+                        ws_rooms.cell(row=row_idx, column=4, value=rt["name"])
+                        ws_rooms.cell(row=row_idx, column=5, value=rt["max_occupancy"])
+                        row_idx += 1
+
+                # Sheet 4: Meal Types Reference
+                ws_meals = wb.create_sheet("Meal_Types")
+                ws_meals.cell(row=1, column=1, value="meal_type_code")
+                ws_meals.cell(row=1, column=2, value="meal_type_name")
+                meal_types = load_all_meal_types()
+                for row_idx, mt in enumerate(meal_types, 2):
+                    ws_meals.cell(row=row_idx, column=1, value=mt["code"])
+                    ws_meals.cell(row=row_idx, column=2, value=mt["name"])
+
+                # Sheet 5: Occupancy Codes Reference
+                ws_occ = wb.create_sheet("Occupancy_Codes")
+                ws_occ.cell(row=1, column=1, value="occupancy_code")
+                ws_occ.cell(row=1, column=2, value="occupancy_name")
+                ws_occ.cell(row=1, column=3, value="capacity")
+                for row_idx, (name, code) in enumerate(OCCUPANCY_CODES.items(), 2):
+                    ws_occ.cell(row=row_idx, column=1, value=code)
+                    ws_occ.cell(row=row_idx, column=2, value=name)
+                    ws_occ.cell(row=row_idx, column=3, value=REQUIRED_OCCUPANCIES[name])
+
+                # Save to bytes
+                excel_buffer = io.BytesIO()
+                wb.save(excel_buffer)
+                excel_data = excel_buffer.getvalue()
+
+                st.download_button(
+                    label="📥 Download Rate Template (Excel)",
+                    data=excel_data,
+                    file_name=f"gap_rate_template_{date.today().strftime('%d-%m-%Y')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                )
+
+            st.caption("Excel template includes reference sheets for suppliers, room types, meal types, and occupancy codes.")
         else:
             st.info("Generate a gap report first to enable export")
 
@@ -676,6 +834,206 @@ def main_dashboard():
                 )
                 fig5.update_layout(height=400)
                 st.plotly_chart(fig5, use_container_width=True)
+
+    # TAB 5: Fill Gaps
+    with tab5:
+        st.subheader("Create Rates to Fill Gaps")
+
+        # Check Hasura connection
+        hasura_connected = test_hasura_connection()
+        if not hasura_connected:
+            st.warning("Hasura GraphQL not configured. Add HASURA_GRAPHQL_URL and HASURA_ADMIN_SECRET to .env file to enable rate creation.")
+
+        if "gaps_df" not in st.session_state or len(st.session_state.gaps_df) == 0:
+            st.info("Generate a gap report first in the 'Gap Report' tab to fill gaps.")
+        else:
+            gaps_df = st.session_state.gaps_df
+
+            st.markdown("### 1. Select Gap to Fill")
+
+            # Create display options for gap selection
+            gap_options = []
+            for i, row in enumerate(gaps_df.iter_rows(named=True)):
+                gap_start_str = row["gap_start"].strftime("%d-%m-%Y") if hasattr(row["gap_start"], "strftime") else str(row["gap_start"])
+                gap_end_str = row["gap_end"].strftime("%d-%m-%Y") if hasattr(row["gap_end"], "strftime") else str(row["gap_end"])
+                label = f"{row['hotel_name']} | {row['gap_type']} | {row['detail']} | {gap_start_str} to {gap_end_str}"
+                gap_options.append(label)
+
+            selected_gap_idx = st.selectbox(
+                "Select a gap to fill",
+                options=range(len(gap_options)),
+                format_func=lambda i: gap_options[i],
+                key="fill_gap_select"
+            )
+
+            # Get selected gap data
+            selected_gap = gaps_df[selected_gap_idx].to_dicts()[0]
+
+            st.markdown("### 2. Gap Details (Read-Only)")
+            col1, col2, col3 = st.columns(3)
+            col1.text_input("Hotel", selected_gap["hotel_name"], disabled=True, key="gap_hotel")
+            col2.text_input("City", selected_gap["city"], disabled=True, key="gap_city")
+            col3.text_input("Star Rating", str(selected_gap["star_rating"]), disabled=True, key="gap_stars")
+
+            col1, col2, col3 = st.columns(3)
+            col1.text_input("Gap Type", selected_gap["gap_type"], disabled=True, key="gap_type_display")
+            col2.text_input("Gap Start", selected_gap["gap_start"].strftime("%Y-%m-%d") if hasattr(selected_gap["gap_start"], "strftime") else str(selected_gap["gap_start"]), disabled=True, key="gap_start_display")
+            col3.text_input("Gap End", selected_gap["gap_end"].strftime("%Y-%m-%d") if hasattr(selected_gap["gap_end"], "strftime") else str(selected_gap["gap_end"]), disabled=True, key="gap_end_display")
+
+            st.text_input("Detail", selected_gap["detail"], disabled=True, key="gap_detail_display")
+
+            st.markdown("### 3. Rate Details (Fill In)")
+
+            # Supplier dropdown
+            supplier_options = {s["name"]: str(s["id"]) for s in all_suppliers}
+            selected_supplier_name = st.selectbox(
+                "Supplier",
+                list(supplier_options.keys()),
+                key="rate_supplier"
+            )
+            selected_supplier_id = supplier_options[selected_supplier_name]
+
+            # Room type dropdown (filtered by hotel)
+            hotel_id = selected_gap["hotel_id"]
+            room_types = load_room_types_for_hotel(hotel_id)
+
+            if not room_types:
+                st.warning(f"No room types found for this hotel. Please add room types first.")
+                room_type_options = {}
+            else:
+                room_type_options = {f"{rt['name']} (max {rt['max_occupancy']})": str(rt["id"]) for rt in room_types}
+
+            selected_room_type_name = st.selectbox(
+                "Room Type",
+                list(room_type_options.keys()) if room_type_options else ["No room types available"],
+                key="rate_room_type",
+                disabled=not room_type_options
+            )
+            selected_room_type_id = room_type_options.get(selected_room_type_name, "")
+
+            # Occupancy
+            occupancy = st.selectbox(
+                "Occupancy",
+                list(OCCUPANCY_CODES.keys()),
+                key="rate_occupancy",
+                format_func=lambda x: f"{x} ({OCCUPANCY_CODES[x]})"
+            )
+            occupancy_code = OCCUPANCY_CODES[occupancy]
+
+            # Rates
+            col1, col2 = st.columns(2)
+            with col1:
+                weekday_rate = st.number_input("Weekday Rate", min_value=0.0, step=10.0, key="rate_weekday")
+            with col2:
+                weekend_rate = st.number_input("Weekend Rate", min_value=0.0, step=10.0, key="rate_weekend")
+
+            # Currency and rate type
+            col1, col2 = st.columns(2)
+            with col1:
+                currency = st.selectbox("Currency", ["SAR", "USD", "EUR"], key="rate_currency")
+            with col2:
+                rate_type = st.selectbox(
+                    "Rate Type",
+                    ["subject_to_availability", "guaranteed"],
+                    key="rate_type_select"
+                )
+
+            # Meal type
+            meal_types = load_all_meal_types()
+            meal_type_options = {mt["name"]: mt["code"] for mt in meal_types}
+            selected_meal_name = st.selectbox(
+                "Included Meal",
+                list(meal_type_options.keys()),
+                key="rate_meal_type"
+            )
+            selected_meal_code = meal_type_options[selected_meal_name]
+
+            # Optional fields
+            col1, col2 = st.columns(2)
+            with col1:
+                min_booking_days = st.number_input(
+                    "Min Booking Days in Advance",
+                    min_value=0,
+                    value=0,
+                    key="rate_min_booking"
+                )
+            with col2:
+                num_rooms = st.number_input(
+                    "Number of Rooms",
+                    min_value=1,
+                    value=1,
+                    key="rate_num_rooms"
+                )
+
+            st.markdown("### 4. Submit")
+
+            # Show what will be created
+            with st.expander("Preview Rate Data"):
+                st.json({
+                    "organization_id": selected_gap.get("organization_id", "N/A"),
+                    "hotel_id": hotel_id,
+                    "room_type_id": selected_room_type_id,
+                    "supplier_id": selected_supplier_id,
+                    "start_date": selected_gap["gap_start"].strftime("%Y-%m-%d") if hasattr(selected_gap["gap_start"], "strftime") else str(selected_gap["gap_start"]),
+                    "end_date": selected_gap["gap_end"].strftime("%Y-%m-%d") if hasattr(selected_gap["gap_end"], "strftime") else str(selected_gap["gap_end"]),
+                    "occupancy": occupancy_code,
+                    "weekday_rate": weekday_rate,
+                    "weekend_rate": weekend_rate,
+                    "currency": currency,
+                    "rate_type": rate_type,
+                    "included_meal_type_code": selected_meal_code,
+                    "min_booking_days_in_advance": min_booking_days if min_booking_days > 0 else None,
+                    "num_of_rooms": num_rooms,
+                    "status": "pending_approval"
+                })
+
+            # Submit button
+            submit_disabled = not hasura_connected or not room_type_options or weekday_rate <= 0 or weekend_rate <= 0
+
+            if st.button("Create Rate", type="primary", disabled=submit_disabled, key="submit_rate"):
+                # Prepare dates
+                start_date_str = selected_gap["gap_start"].strftime("%Y-%m-%d") if hasattr(selected_gap["gap_start"], "strftime") else str(selected_gap["gap_start"])
+                end_date_str = selected_gap["gap_end"].strftime("%Y-%m-%d") if hasattr(selected_gap["gap_end"], "strftime") else str(selected_gap["gap_end"])
+
+                with st.spinner("Creating rate..."):
+                    result = insert_hotel_rate(
+                        organization_id=selected_gap.get("organization_id", ""),
+                        hotel_id=hotel_id,
+                        room_type_id=selected_room_type_id,
+                        supplier_id=selected_supplier_id,
+                        start_date=start_date_str,
+                        end_date=end_date_str,
+                        occupancy=occupancy_code,
+                        weekday_rate=weekday_rate,
+                        weekend_rate=weekend_rate,
+                        currency=currency,
+                        rate_type=rate_type,
+                        included_meal_type_code=selected_meal_code,
+                        min_booking_days_in_advance=min_booking_days if min_booking_days > 0 else None,
+                        num_of_rooms=num_rooms,
+                    )
+
+                if "errors" in result:
+                    error_msg = result["errors"][0].get("message", "Unknown error")
+                    if "unique constraint" in error_msg.lower():
+                        st.error("A rate with these exact dates, room type, supplier, and occupancy already exists.")
+                    else:
+                        st.error(f"Error creating rate: {error_msg}")
+                else:
+                    rate_id = result.get("data", {}).get("insert_hotel_rates_one", {}).get("id", "N/A")
+                    st.success(f"Rate created successfully! ID: {rate_id}")
+                    st.info("Note: Rate status is 'pending_approval'. Refresh data to see updated gaps.")
+
+                    # Clear rate cache
+                    if st.button("Refresh Data", key="refresh_after_create"):
+                        load_all_rates.clear()
+                        st.rerun()
+
+            if submit_disabled and hasura_connected:
+                if not room_type_options:
+                    st.caption("Cannot submit: No room types available for this hotel.")
+                elif weekday_rate <= 0 or weekend_rate <= 0:
+                    st.caption("Cannot submit: Rates must be greater than 0.")
 
 
 def main():

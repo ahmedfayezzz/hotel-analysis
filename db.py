@@ -109,6 +109,7 @@ def get_hotel_rates(
     query = """
         SELECT
             h.id as hotel_id,
+            h.organization_id,
             h.name as hotel_name,
             CASE h.giata_city_id
                 WHEN '20300' THEN 'Makkah'
@@ -174,3 +175,18 @@ def test_connection() -> bool:
     except Exception as e:
         print(f"Connection error: {e}")
         return False
+
+
+def get_room_types_by_hotel(hotel_id: str) -> list:
+    """Get room types for a specific hotel."""
+    query = """
+        SELECT rt.id, rt.name, rt.max_occupancy
+        FROM room_types rt
+        WHERE rt.hotel_id = %s
+        ORDER BY rt.name
+    """
+
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, [hotel_id])
+            return cur.fetchall()
